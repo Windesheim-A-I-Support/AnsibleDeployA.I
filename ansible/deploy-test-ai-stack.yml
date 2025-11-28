@@ -1,0 +1,395 @@
+---
+# Ansible Playbook for Test AI Stack Deployment
+# Usage: ansible-playbook -i inventory.yml deploy-test-ai-stack.yml
+# Target: 10.0.6.x test network
+
+- name: Deploy Test AI Stack Infrastructure
+  hosts: test_ai_containers
+  become: yes
+  gather_facts: yes
+
+  vars:
+    repo_dir: "/opt/local-ai-packaged"
+    deployment_timestamp: "{{ ansible_date_time.epoch }}"
+
+  tasks:
+    - name: Display deployment information
+      debug:
+        msg: |
+          ============================================
+          Deploying TEST AI Stack
+          ============================================
+          Host: {{ inventory_hostname }}
+          IP: {{ ansible_host }}
+          Domain: {{ domain_prefix }}.{{ base_domain }}
+          Profile: {{ docker_compose_profile }}
+          Environment: {{ environment_type }}
+          Container Prefix: {{ container_prefix }}
+          Network: {{ test_network }}
+          ============================================
+
+    # ======================================
+    # STEP 1: SYSTEM DEPENDENCIES
+    # ======================================
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - curl
+          - ca-certificates
+          - gnupg
+          - git
+          - python3
+        state: present
+
+    - name: Verify Python 3 installation
+      command: python3 --version
+      register: python_version
+      changed_when: false
+
+    - name: Display Python version
+      debug:
+        msg: "Python version: {{ python_version.stdout }}"
+
+    # ======================================
+    # STEP 2: DOCKER INSTALLATION
+    # ======================================
+    - name: Check if Docker is installed
+      command: docker --version
+      register: docker_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Docker
+      when: docker_check.rc != 0
+      block:
+        - name: Add Docker GPG key
+          apt_key:
+            url: https://download.docker.com/linux/debian/gpg
+            state: present
+
+        - name: Get Debian version
+          command: lsb_release -cs
+          register: debian_version
+          changed_when: false
+
+        - name: Add Docker repository
+          apt_repository:
+            repo: "deb [arch=amd64] https://download.docker.com/linux/debian {{ debian_version.stdout }} stable"
+            state: present
+
+        - name: Install Docker packages
+          apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
+            update_cache: yes
+
+        - name: Enable Docker service
+          systemd:
+            name: docker
+            enabled: yes
+            state: started
+
+    - name: Verify Docker installation
+      command: docker --version
+      register: docker_version
+      changed_when: false
+
+    - name: Display Docker version
+      debug:
+        msg: "{{ docker_version.stdout }}"
+
+    # ======================================
+    # STEP 3: USER SETUP
+    # ======================================
+    - name: Create AI admin user
+      user:
+        name: "{{ ai_admin_user }}"
+        groups: docker
+        append: yes
+        shell: /bin/bash
+        create_home: yes
+        state: present
+
+    - name: Add sudoers rule for ai-admin
+      lineinfile:
+        path: /etc/sudoers.d/{{ ai_admin_user }}
+        line: "{{ ai_admin_user }} ALL=(ALL) NOPASSWD: ALL"
+        create: yes
+        mode: '0440'
+        validate: 'visudo -cf %s'
+
+    # ======================================
+    # STEP 4: CLONE REPOSITORY
+    # ======================================
+    - name: Remove existing repository directory
+      file:
+        path: "{{ repo_dir }}"
+        state: absent
+
+    - name: Clone AI repository
+      git:
+        repo: "{{ ai_repo_url }}"
+        dest: "{{ repo_dir }}"
+        version: "{{ ai_repo_branch }}"
+        force: yes
+
+    - name: Set repository ownership
+      file:
+        path: "{{ repo_dir }}"
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        recurse: yes
+
+    # ======================================
+    # STEP 5: GENERATE SECRETS
+    # ======================================
+    - name: Check if .env.example exists
+      stat:
+        path: "{{ repo_dir }}/.env.example"
+      register: env_example
+
+    - name: Copy .env.example to .env
+      copy:
+        src: "{{ repo_dir }}/.env.example"
+        dest: "{{ repo_dir }}/.env"
+        remote_src: yes
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0600'
+      when: env_example.stat.exists
+
+    - name: Generate secure secrets
+      shell: |
+        python3 << 'EOF'
+        import secrets
+        import random
+
+        secrets_dict = {
+            'N8N_ENCRYPTION_KEY': secrets.token_hex(32),
+            'N8N_USER_MANAGEMENT_JWT_SECRET': secrets.token_hex(32),
+            'POSTGRES_PASSWORD': secrets.token_urlsafe(32),
+            'JWT_SECRET': secrets.token_urlsafe(48),
+            'NEO4J_PASS': secrets.token_urlsafe(16),
+            'CLICKHOUSE_PASSWORD': secrets.token_urlsafe(32),
+            'MINIO_ROOT_PASSWORD': secrets.token_urlsafe(32),
+            'LANGFUSE_SALT': secrets.token_urlsafe(32),
+            'NEXTAUTH_SECRET': secrets.token_urlsafe(32),
+            'ENCRYPTION_KEY': secrets.token_hex(32),
+            'DASHBOARD_PASSWORD': secrets.token_urlsafe(20),
+            'POOLER_TENANT_ID': str(random.randint(1000, 9999)),
+            'SECRET_KEY_BASE': secrets.token_urlsafe(32),
+            'VAULT_ENC_KEY': secrets.token_hex(32)
+        }
+
+        # Output as environment variables
+        for key, value in secrets_dict.items():
+            print(f"{key}={value}")
+        EOF
+      register: generated_secrets
+      changed_when: false
+
+    - name: Update .env with generated secrets
+      lineinfile:
+        path: "{{ repo_dir }}/.env"
+        regexp: "^{{ item.split('=')[0] }}="
+        line: "{{ item }}"
+        state: present
+      loop: "{{ generated_secrets.stdout_lines }}"
+      no_log: true
+
+    - name: Add Docker socket location to .env
+      lineinfile:
+        path: "{{ repo_dir }}/.env"
+        regexp: "^DOCKER_SOCKET_LOCATION="
+        line: "DOCKER_SOCKET_LOCATION=/var/run/docker.sock"
+        state: present
+
+    # ======================================
+    # STEP 6: CONFIGURE INTEGRATIONS
+    # ======================================
+    - name: Backup original docker-compose override
+      copy:
+        src: "{{ repo_dir }}/docker-compose.override.{{ environment_type }}.yml"
+        dest: "{{ repo_dir }}/docker-compose.override.{{ environment_type }}.yml.backup-{{ deployment_timestamp }}"
+        remote_src: yes
+        force: yes
+
+    - name: Configure service integrations
+      shell: |
+        python3 << 'EOF'
+        import re
+
+        file_path = '{{ repo_dir }}/docker-compose.override.{{ environment_type }}.yml'
+
+        # Read the file
+        with open(file_path, 'r') as f:
+            content = f.read()
+
+        # Add Open WebUI integrations
+        if 'open-webui:' in content:
+            env_section = re.search(r'(  open-webui:.*?environment:\s*\n)((?:      - .*\n)*)', content, re.DOTALL)
+            if env_section and 'VECTOR_DB' not in content:
+                new_env = env_section.group(1) + env_section.group(2)
+                new_env += "      - VECTOR_DB=qdrant\n"
+                new_env += "      - QDRANT_URI=http://qdrant:6333\n"
+                new_env += "      - OLLAMA_BASE_URL=http://ollama:11434\n"
+                content = content.replace(env_section.group(0), new_env)
+
+        # Add n8n integrations
+        if 'n8n:' in content:
+            n8n_env = re.search(r'(  n8n:.*?environment:\s*\n)((?:      - .*\n)*)', content, re.DOTALL)
+            if n8n_env and 'NODE_FUNCTION_ALLOW_EXTERNAL' not in content:
+                new_env = n8n_env.group(1) + n8n_env.group(2)
+                new_env += "      - NODE_FUNCTION_ALLOW_EXTERNAL=*\n"
+                content = content.replace(n8n_env.group(0), new_env)
+
+        # Add Ollama configuration
+        if 'ollama-cpu:' in content:
+            ollama_env = re.search(r'(  ollama-cpu:.*?)(    restart:)', content, re.DOTALL)
+            if ollama_env and 'OLLAMA_HOST' not in content:
+                insertion = ollama_env.group(1) + "    environment:\n"
+                insertion += "      - OLLAMA_HOST=0.0.0.0:11434\n"
+                insertion += "      - OLLAMA_ORIGINS=*\n"
+                insertion += "    " + ollama_env.group(2)
+                content = content.replace(ollama_env.group(0), insertion)
+
+        # Write updated content
+        with open(file_path, 'w') as f:
+            f.write(content)
+
+        print("Integration configuration complete")
+        EOF
+      args:
+        chdir: "{{ repo_dir }}"
+      register: integration_result
+
+    - name: Display integration result
+      debug:
+        msg: "{{ integration_result.stdout }}"
+
+    # ======================================
+    # STEP 7: DEPLOY AI STACK
+    # ======================================
+    - name: Display pre-deployment status
+      debug:
+        msg: |
+          ============================================
+          Starting AI Stack Deployment
+          ============================================
+          Repository: {{ repo_dir }}
+          Profile: {{ docker_compose_profile }}
+          Environment: {{ environment_type }}
+          ============================================
+
+    - name: Deploy AI Stack with start_services.py
+      command: >
+        python3 start_services.py
+        --profile {{ docker_compose_profile }}
+        --environment {{ environment_type }}
+      args:
+        chdir: "{{ repo_dir }}"
+      register: deployment_result
+      async: 900
+      poll: 15
+      become_user: "{{ ai_admin_user }}"
+
+    - name: Display deployment output
+      debug:
+        msg: "{{ deployment_result.stdout_lines }}"
+
+    # ======================================
+    # STEP 8: POST-DEPLOYMENT VERIFICATION
+    # ======================================
+    - name: Wait for Open WebUI to be ready
+      wait_for:
+        host: localhost
+        port: "{{ open_webui_port }}"
+        state: started
+        timeout: 300
+        delay: 10
+      ignore_errors: yes
+
+    - name: Wait for Ollama to be ready
+      wait_for:
+        host: localhost
+        port: "{{ ollama_port }}"
+        state: started
+        timeout: 300
+        delay: 10
+      ignore_errors: yes
+
+    - name: Wait for Qdrant to be ready
+      wait_for:
+        host: localhost
+        port: "{{ qdrant_port }}"
+        state: started
+        timeout: 300
+        delay: 10
+      ignore_errors: yes
+
+    - name: Check running containers
+      command: docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+      register: container_status
+      changed_when: false
+      become_user: "{{ ai_admin_user }}"
+
+    - name: Display container status
+      debug:
+        msg: "{{ container_status.stdout_lines }}"
+
+    - name: Check for failed containers
+      command: docker ps -a --filter "status=exited" --format "table {{.Names}}\t{{.Status}}"
+      register: failed_containers
+      changed_when: false
+      become_user: "{{ ai_admin_user }}"
+
+    - name: Display failed containers (if any)
+      debug:
+        msg: "{{ failed_containers.stdout_lines }}"
+      when: failed_containers.stdout_lines | length > 1
+
+    - name: Get Docker volume list
+      command: docker volume ls --format "table {{.Name}}\t{{.Driver}}"
+      register: volume_list
+      changed_when: false
+      become_user: "{{ ai_admin_user }}"
+
+    - name: Display Docker volumes
+      debug:
+        msg: "{{ volume_list.stdout_lines }}"
+
+    # ======================================
+    # STEP 9: DEPLOYMENT SUMMARY
+    # ======================================
+    - name: Display deployment summary
+      debug:
+        msg: |
+          ============================================
+          TEST AI STACK DEPLOYMENT COMPLETE
+          ============================================
+          Host: {{ ansible_host }}
+          Container Prefix: {{ container_prefix }}
+
+          Services should be accessible at:
+          - Open WebUI: http://{{ ansible_host }}:{{ open_webui_port }}
+          - Ollama: http://{{ ansible_host }}:{{ ollama_port }}
+          - Qdrant: http://{{ ansible_host }}:{{ qdrant_port }}
+          - n8n: http://{{ ansible_host }}:{{ n8n_port }}
+          - Flowise: http://{{ ansible_host }}:{{ flowise_port }}
+          - Langfuse: http://{{ ansible_host }}:{{ langfuse_port }}
+
+          Next Steps:
+          1. Configure Traefik routing for test domains
+          2. Verify service integrations
+          3. Pull Ollama models (nomic-embed-text)
+          ============================================

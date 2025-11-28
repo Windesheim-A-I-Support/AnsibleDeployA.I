@@ -1,0 +1,308 @@
+---
+# Ansible Inventory for Distributed AI Stack Deployment
+# Usage: ansible-playbook -i inventory.yml <playbook>.yml
+
+all:
+  children:
+    # ==========================================
+    # TRAEFIK REVERSE PROXY
+    # ==========================================
+    traefik_servers:
+      hosts:
+        traefik-01:
+          ansible_host: 10.0.4.10
+          ansible_user: root
+          ansible_python_interpreter: /usr/bin/python3
+      vars:
+        traefik_domain: valuechainhackers.xyz
+        cloudflare_email: christiaan.gerardo@gmail.com
+        traefik_dynamic_dir: /opt/traefik-stack/dynamic
+
+    # ==========================================
+    # TIER 5: CRITICAL INFRASTRUCTURE (SSO, Secrets)
+    # ==========================================
+    critical_infrastructure:
+      hosts:
+        critical-infra-01:
+          ansible_host: 10.0.6.5
+          ansible_user: root
+          ansible_python_interpreter: /usr/bin/python3
+          container_name: critical-infra
+
+          # Services
+          authentik_port: 9000
+          authentik_https_port: 9443
+          vaultwarden_port: 8080
+          authelia_port: 9091
+
+      vars:
+        services:
+          - authentik
+          - vaultwarden
+          - authelia
+
+    # ==========================================
+    # TIER 1: SHARED AI INFRASTRUCTURE
+    # ==========================================
+    shared_ai_infrastructure:
+      hosts:
+        shared-ai-01:
+          ansible_host: 10.0.6.10
+          ansible_user: root
+          ansible_python_interpreter: /usr/bin/python3
+          container_name: shared-ai-stack
+
+          # Core AI Services
+          ollama_port: 11434
+          qdrant_port: 6333
+          postgres_port: 5432
+          neo4j_http_port: 7474
+          neo4j_bolt_port: 7687
+          minio_api_port: 9000
+          minio_console_port: 9011
+
+          # AI Utilities
+          langfuse_port: 3002
+          searxng_port: 8081
+          tika_port: 9998
+          gotenberg_port: 3003
+          piston_port: 2000
+          browserless_port: 3000
+          alltalk_port: 7851
+          whisper_port: 9000
+          stirling_pdf_port: 8088
+          litellm_port: 4000
+
+          # Search
+          meilisearch_port: 7700
+
+          # Supabase
+          supabase_port: 8000
+
+      vars:
+        ai_repo_url: https://github.com/coleam00/local-ai-packaged.git
+        ai_repo_branch: stable
+        docker_compose_profile: cpu
+        environment_type: private
+
+        services:
+          # Core
+          - ollama
+          - qdrant
+          - postgresql
+          - neo4j
+          - minio
+          # Utilities
+          - langfuse
+          - searxng
+          - tika
+          - gotenberg
+          - piston
+          - browserless
+          - alltalk
+          - whisper
+          - stirling-pdf
+          - litellm
+          - meilisearch
+          - supabase
+
+    # ==========================================
+    # TIER 3: MONITORING & DEVOPS
+    # ==========================================
+    monitoring_infrastructure:
+      hosts:
+        monitoring-01:
+          ansible_host: 10.0.6.15
+          ansible_user: root
+          ansible_python_interpreter: /usr/bin/python3
+          container_name: monitoring-stack
+
+          # Monitoring Services
+          grafana_port: 3100
+          prometheus_port: 9090
+          loki_port: 3100
+          uptime_kuma_port: 3201
+          portainer_port: 9443
+          dozzle_port: 8080
+          posthog_port: 8001
+          plausible_port: 8002
+
+      vars:
+        services:
+          - grafana
+          - prometheus
+          - loki
+          - promtail
+          - uptime-kuma
+          - portainer
+          - dozzle
+          - watchtower
+          - posthog
+          - plausible
+
+    # ==========================================
+    # TIER 3: COLLABORATION & KNOWLEDGE
+    # ==========================================
+    collaboration_infrastructure:
+      hosts:
+        collaboration-01:
+          ansible_host: 10.0.6.20
+          ansible_user: root
+          ansible_python_interpreter: /usr/bin/python3
+          container_name: collaboration-stack
+
+          # Collaboration Services
+          outline_port: 3000
+          wikijs_port: 3001
+          elabftw_port: 443
+          label_studio_port: 8080
+          nextcloud_port: 443
+          gitea_port: 3002
+          kanboard_port: 80
+          mattermost_port: 8065
+          cal_com_port: 3003
+          jitsi_port: 8443
+          formbricks_port: 3004
+          mailserver_smtp_port: 25
+          mailserver_submission_port: 587
+          mailserver_imap_port: 993
+          mailserver_web_port: 80
+
+      vars:
+        services:
+          - outline
+          - wikijs
+          - elabftw
+          - label-studio
+          - nextcloud
+          - gitea
+          - kanboard
+          - mattermost
+          - cal-com
+          - jitsi-meet
+          - formbricks
+          - docker-mailserver
+
+    # ==========================================
+    # TIER 4: DATA & ANALYTICS (OPTIONAL)
+    # ==========================================
+    analytics_infrastructure:
+      hosts:
+        analytics-01:
+          ansible_host: 10.0.6.25
+          ansible_user: root
+          ansible_python_interpreter: /usr/bin/python3
+          container_name: analytics-stack
+
+          # Analytics Services
+          metabase_port: 3003
+          superset_port: 8088
+          prefect_port: 4200
+          redash_port: 5000
+
+      vars:
+        services:
+          - metabase
+          - apache-superset
+          - prefect
+          - redash
+
+    # ==========================================
+    # TIER 2: PER-USER SERVICES
+    # ==========================================
+    user_services:
+      hosts:
+        user1-services:
+          ansible_host: 10.0.6.11
+          ansible_user: root
+          ansible_python_interpreter: /usr/bin/python3
+          container_name: user1-services
+          user_id: user1
+          user_name: "User 1"
+          user_email: "user1@valuechainhackers.xyz"
+
+          # Service Ports
+          open_webui_port: 3000
+          n8n_port: 5678
+          flowise_port: 3001
+          jupyterhub_port: 8000
+          rstudio_port: 8787
+
+          # Domain Prefixes
+          domain_prefix_openwebui: test-user1-openwebui
+          domain_prefix_n8n: test-user1-n8n
+          domain_prefix_flowise: test-user1-flowise
+          domain_prefix_jupyter: test-user1-jupyter
+          domain_prefix_rstudio: test-user1-rstudio
+
+        user2-services:
+          ansible_host: 10.0.6.12
+          ansible_user: root
+          ansible_python_interpreter: /usr/bin/python3
+          container_name: user2-services
+          user_id: user2
+          user_name: "User 2"
+          user_email: "user2@valuechainhackers.xyz"
+
+          open_webui_port: 3000
+          n8n_port: 5678
+          flowise_port: 3001
+          jupyterhub_port: 8000
+          rstudio_port: 8787
+
+          domain_prefix_openwebui: test-user2-openwebui
+          domain_prefix_n8n: test-user2-n8n
+          domain_prefix_flowise: test-user2-flowise
+          domain_prefix_jupyter: test-user2-jupyter
+          domain_prefix_rstudio: test-user2-rstudio
+
+        user3-services:
+          ansible_host: 10.0.6.13
+          ansible_user: root
+          ansible_python_interpreter: /usr/bin/python3
+          container_name: user3-services
+          user_id: user3
+          user_name: "User 3"
+          user_email: "user3@valuechainhackers.xyz"
+
+          open_webui_port: 3000
+          n8n_port: 5678
+          flowise_port: 3001
+          jupyterhub_port: 8000
+          rstudio_port: 8787
+
+          domain_prefix_openwebui: test-user3-openwebui
+          domain_prefix_n8n: test-user3-n8n
+          domain_prefix_flowise: test-user3-flowise
+          domain_prefix_jupyter: test-user3-jupyter
+          domain_prefix_rstudio: test-user3-rstudio
+
+      vars:
+        # Shared infrastructure connection points
+        shared_ai_host: 10.0.6.10
+        shared_postgres_host: 10.0.6.10
+        shared_ollama_host: 10.0.6.10
+        shared_qdrant_host: 10.0.6.10
+        shared_langfuse_host: 10.0.6.10
+        shared_minio_host: 10.0.6.10
+        shared_neo4j_host: 10.0.6.10
+
+        authentik_host: 10.0.6.5
+
+        services:
+          - open-webui
+          - n8n
+          - flowise
+
+  vars:
+    # Global variables
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+    base_domain: valuechainhackers.xyz
+    test_network: 10.0.6.0/24
+
+    # Common user
+    ai_admin_user: ai-admin
+
+    # Vault integration (secrets will be retrieved from Vaultwarden)
+    use_vaultwarden: true
+    vaultwarden_url: "http://10.0.6.5:8080"

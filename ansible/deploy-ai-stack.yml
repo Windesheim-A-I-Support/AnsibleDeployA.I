@@ -1,0 +1,179 @@
+---
+# Ansible Playbook for AI Stack Deployment
+# Usage: ansible-playbook -i inventory.yml deploy-ai-stack.yml
+
+- name: Deploy AI Stack Infrastructure
+  hosts: ai_containers
+  become: yes
+  gather_facts: yes
+
+  vars:
+    repo_dir: "/opt/local-ai-packaged"
+    scripts_dir: "/root/deployment-scripts"
+
+  tasks:
+    - name: Display deployment information
+      debug:
+        msg: |
+          Deploying AI Stack to {{ inventory_hostname }}
+          IP: {{ ansible_host }}
+          Domain: {{ domain_prefix }}.{{ base_domain }}
+          Profile: {{ docker_compose_profile }}
+          Environment: {{ environment_type }}
+
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - curl
+          - ca-certificates
+          - gnupg
+          - git
+          - python3
+        state: present
+
+    - name: Check if Docker is installed
+      command: docker --version
+      register: docker_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Docker
+      when: docker_check.rc != 0
+      block:
+        - name: Add Docker GPG key
+          apt_key:
+            url: https://download.docker.com/linux/debian/gpg
+            state: present
+
+        - name: Add Docker repository
+          apt_repository:
+            repo: "deb [arch=amd64] https://download.docker.com/linux/debian {{ ansible_distribution_release }} stable"
+            state: present
+
+        - name: Install Docker packages
+          apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
+            update_cache: yes
+
+        - name: Enable Docker service
+          systemd:
+            name: docker
+            enabled: yes
+            state: started
+
+    - name: Create AI admin user
+      user:
+        name: "{{ ai_admin_user }}"
+        groups: docker
+        append: yes
+        shell: /bin/bash
+        create_home: yes
+
+    - name: Clone AI repository
+      git:
+        repo: "{{ ai_repo_url }}"
+        dest: "{{ repo_dir }}"
+        version: "{{ ai_repo_branch }}"
+        force: yes
+
+    - name: Generate .env file from template
+      template:
+        src: templates/env.j2
+        dest: "{{ repo_dir }}/.env"
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0600'
+
+    - name: Backup original docker-compose override
+      copy:
+        src: "{{ repo_dir }}/docker-compose.override.{{ environment_type }}.yml"
+        dest: "{{ repo_dir }}/docker-compose.override.{{ environment_type }}.yml.backup"
+        remote_src: yes
+        force: no
+
+    - name: Configure service integrations
+      template:
+        src: templates/docker-compose.override.private.yml.j2
+        dest: "{{ repo_dir }}/docker-compose.override.private.yml"
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0644'
+
+    - name: Deploy AI Stack
+      command: >
+        python3 start_services.py
+        --profile {{ docker_compose_profile }}
+        --environment {{ environment_type }}
+      args:
+        chdir: "{{ repo_dir }}"
+      register: deployment_result
+      async: 600
+      poll: 10
+
+    - name: Display deployment result
+      debug:
+        var: deployment_result.stdout_lines
+
+    - name: Wait for services to be healthy
+      wait_for:
+        host: localhost
+        port: "{{ item }}"
+        state: started
+        timeout: 300
+      loop:
+        - 3000  # Open WebUI
+        - 11434 # Ollama
+        - 6333  # Qdrant
+      ignore_errors: yes
+
+    - name: Check running containers
+      command: docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+      register: container_status
+      changed_when: false
+
+    - name: Display container status
+      debug:
+        msg: "{{ container_status.stdout_lines }}"
+
+- name: Configure Traefik Routing
+  hosts: traefik_servers
+  become: yes
+  gather_facts: no
+
+  vars:
+    traefik_dynamic_dir: "/opt/traefik-stack/dynamic"
+
+  tasks:
+    - name: Create backup directory
+      file:
+        path: "{{ traefik_dynamic_dir }}/.backup-{{ ansible_date_time.iso8601_basic_short }}"
+        state: directory
+        mode: '0755'
+
+    - name: Backup existing Traefik configs
+      shell: "cp {{ traefik_dynamic_dir }}/*.yml {{ traefik_dynamic_dir }}/.backup-{{ ansible_date_time.iso8601_basic_short }}/ 2>/dev/null || true"
+      changed_when: false
+
+    - name: Deploy Traefik routing configuration
+      template:
+        src: templates/traefik-routing.yml.j2
+        dest: "{{ traefik_dynamic_dir }}/{{ hostvars[item].ansible_host | replace('.', '') }}LocalAi.yml"
+        mode: '0644'
+      loop: "{{ groups['ai_containers'] }}"
+      notify: Reload Traefik
+
+  handlers:
+    - name: Reload Traefik
+      command: docker restart traefik-proxy
+      changed_when: true

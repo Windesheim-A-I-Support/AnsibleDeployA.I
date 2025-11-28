@@ -1,0 +1,382 @@
+---
+# PHASE 6 (MINIMAL): Deploy User Services
+# Usage: ansible-playbook -i inventory-minimal.yml 06-deploy-user-services-minimal.yml
+#
+# This playbook deploys per-user AI services:
+# - Open WebUI (connected to Ollama, Qdrant)
+# - n8n (connected to PostgreSQL, Ollama)
+#
+# Container: 10.0.6.11 (user1)
+
+- name: Phase 6 (Minimal) - Deploy User Services
+  hosts: user_services
+  become: yes
+  gather_facts: yes
+
+  vars:
+    repo_dir: "/opt/{{ user_id }}-services"
+    compose_file: "{{ repo_dir }}/docker-compose.yml"
+
+  tasks:
+    - name: Display deployment information
+      debug:
+        msg: |
+          ============================================
+          PHASE 6 (MINIMAL): USER SERVICES
+          ============================================
+          Host: {{ inventory_hostname }}
+          IP: {{ ansible_host }}
+          User: {{ user_id }}
+          Services: Open WebUI, n8n
+          ============================================
+
+    # ======================================
+    # SYSTEM SETUP
+    # ======================================
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - curl
+          - ca-certificates
+          - gnupg
+          - git
+          - python3
+          - python3-pip
+        state: present
+
+    - name: Install Python Docker libraries
+      pip:
+        name:
+          - docker
+          - docker-compose
+        state: present
+
+    # ======================================
+    # DOCKER INSTALLATION
+    # ======================================
+    - name: Check if Docker is installed
+      command: docker --version
+      register: docker_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Docker
+      when: docker_check.rc != 0
+      block:
+        - name: Add Docker GPG key
+          apt_key:
+            url: https://download.docker.com/linux/debian/gpg
+            state: present
+
+        - name: Get Debian version
+          command: lsb_release -cs
+          register: debian_version
+          changed_when: false
+
+        - name: Add Docker repository
+          apt_repository:
+            repo: "deb [arch=amd64] https://download.docker.com/linux/debian {{ debian_version.stdout }} stable"
+            state: present
+
+        - name: Install Docker packages
+          apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
+            update_cache: yes
+
+        - name: Enable Docker service
+          systemd:
+            name: docker
+            enabled: yes
+            state: started
+
+    # ======================================
+    # USER SETUP
+    # ======================================
+    - name: Create AI admin user
+      user:
+        name: "{{ ai_admin_user }}"
+        groups: docker
+        append: yes
+        shell: /bin/bash
+        create_home: yes
+        state: present
+
+    # ======================================
+    # GENERATE SECRETS
+    # ======================================
+    - name: Generate n8n secrets
+      shell: |
+        python3 << 'EOF'
+        import secrets
+        secrets_dict = {
+            'N8N_ENCRYPTION_KEY': secrets.token_hex(32),
+            'N8N_USER_MANAGEMENT_JWT_SECRET': secrets.token_hex(32),
+        }
+        for key, value in secrets_dict.items():
+            print(f"{key}={value}")
+        EOF
+      register: n8n_secrets
+      changed_when: false
+      no_log: true
+
+    # ======================================
+    # DIRECTORY SETUP
+    # ======================================
+    - name: Create repository directory
+      file:
+        path: "{{ repo_dir }}"
+        state: directory
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0755'
+
+    - name: Create data directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0755'
+      loop:
+        - "{{ repo_dir }}/openwebui"
+        - "{{ repo_dir }}/n8n"
+
+    # ======================================
+    # DOCKER COMPOSE CONFIGURATION
+    # ======================================
+    - name: Create docker-compose.yml for user services
+      copy:
+        dest: "{{ compose_file }}"
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0644'
+        content: |
+          version: '3.8'
+
+          services:
+            # ==========================================
+            # Open WebUI - Chat Interface
+            # ==========================================
+            open-webui:
+              image: ghcr.io/open-webui/open-webui:main
+              container_name: {{ user_id }}-openwebui
+              volumes:
+                - openwebui_data:/app/backend/data
+              networks:
+                - user_network
+              ports:
+                - "{{ open_webui_port }}:8080"
+              restart: unless-stopped
+              environment:
+                # Ollama connection
+                - OLLAMA_BASE_URL=http://{{ shared_ai_host }}:11434
+                # Qdrant connection
+                - VECTOR_DB=qdrant
+                - QDRANT_URI=http://{{ shared_ai_host }}:6333
+                - QDRANT_COLLECTION={{ user_id }}_documents
+                # Basic config
+                - WEBUI_NAME=AI Assistant ({{ user_id }})
+                - ENABLE_SIGNUP=true
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+
+            # ==========================================
+            # n8n - Workflow Automation
+            # ==========================================
+            n8n:
+              image: n8nio/n8n:latest
+              container_name: {{ user_id }}-n8n
+              volumes:
+                - n8n_data:/home/node/.n8n
+              networks:
+                - user_network
+              ports:
+                - "{{ n8n_port }}:5678"
+              restart: unless-stopped
+              environment:
+                # Database connection
+                - DB_TYPE=postgresdb
+                - DB_POSTGRESDB_HOST={{ shared_ai_host }}
+                - DB_POSTGRESDB_PORT=5432
+                - DB_POSTGRESDB_DATABASE={{ user_id }}_n8n
+                - DB_POSTGRESDB_USER=postgres
+                - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+                # n8n secrets
+                - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+                - N8N_USER_MANAGEMENT_JWT_SECRET=${N8N_USER_MANAGEMENT_JWT_SECRET}
+                # Ollama integration
+                - NODE_FUNCTION_ALLOW_EXTERNAL=*
+                # Basic config
+                - N8N_HOST={{ ansible_host }}
+                - N8N_PORT=5678
+                - N8N_PROTOCOL=http
+                - WEBHOOK_URL=http://{{ ansible_host }}:5678/
+              healthcheck:
+                test: ["CMD", "wget", "--spider", "-q", "http://localhost:5678/healthz"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+
+          # ==========================================
+          # NETWORKS
+          # ==========================================
+          networks:
+            user_network:
+              driver: bridge
+
+          # ==========================================
+          # VOLUMES
+          # ==========================================
+          volumes:
+            openwebui_data:
+              driver: local
+            n8n_data:
+              driver: local
+
+    # ======================================
+    # .ENV FILE
+    # ======================================
+    - name: Create .env file
+      copy:
+        dest: "{{ repo_dir }}/.env"
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0600'
+        content: |
+          # User {{ user_id }} Services Secrets
+          # Generated: {{ ansible_date_time.iso8601 }}
+
+          # PostgreSQL (from shared infrastructure)
+          POSTGRES_PASSWORD=CHANGEME
+
+          {% for line in n8n_secrets.stdout_lines %}
+          {{ line }}
+          {% endfor %}
+      no_log: true
+
+    - name: Display .env file location for manual edit
+      debug:
+        msg: |
+          ⚠️  IMPORTANT: You must update the .env file with the PostgreSQL password from shared infrastructure!
+
+          Edit {{ repo_dir }}/.env and replace CHANGEME with the actual POSTGRES_PASSWORD
+          from ./shared-ai-secrets-*.txt
+
+          Then restart services: cd {{ repo_dir }} && docker compose restart
+
+    # ======================================
+    # DEPLOY SERVICES
+    # ======================================
+    - name: Start user services
+      community.docker.docker_compose:
+        project_src: "{{ repo_dir }}"
+        state: present
+        pull: yes
+      register: compose_output
+      ignore_errors: yes
+
+    - name: Wait for services to initialize
+      pause:
+        seconds: 20
+        prompt: "Waiting for containers to start..."
+
+    # ======================================
+    # VERIFICATION
+    # ======================================
+    - name: Check running containers
+      command: docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+      register: container_status
+      changed_when: false
+
+    - name: Display container status
+      debug:
+        msg: "{{ container_status.stdout_lines }}"
+
+    - name: Wait for Open WebUI
+      wait_for:
+        host: localhost
+        port: "{{ open_webui_port }}"
+        state: started
+        timeout: 120
+      ignore_errors: yes
+
+    - name: Wait for n8n
+      wait_for:
+        host: localhost
+        port: "{{ n8n_port }}"
+        state: started
+        timeout: 120
+      ignore_errors: yes
+
+    # ======================================
+    # SAVE SECRETS
+    # ======================================
+    - name: Save secrets to local file
+      delegate_to: localhost
+      copy:
+        dest: "./{{ user_id }}-secrets-{{ ansible_date_time.epoch }}.txt"
+        content: |
+          # {{ user_id }} Services Secrets
+          # Generated: {{ ansible_date_time.iso8601 }}
+          # Host: {{ ansible_host }}
+
+          {% for line in n8n_secrets.stdout_lines %}
+          {{ line }}
+          {% endfor %}
+
+          # Connection Info:
+          Open WebUI: http://{{ ansible_host }}:{{ open_webui_port }}
+          n8n: http://{{ ansible_host }}:{{ n8n_port }}
+
+          # Shared Infrastructure Connections:
+          Ollama: http://{{ shared_ai_host }}:11434
+          Qdrant: http://{{ shared_ai_host }}:6333
+          PostgreSQL: {{ shared_ai_host }}:5432 (database: {{ user_id }}_n8n)
+        mode: '0600'
+      no_log: true
+
+    # ======================================
+    # POST-DEPLOYMENT SUMMARY
+    # ======================================
+    - name: Display deployment summary
+      debug:
+        msg: |
+          ============================================
+          USER SERVICES DEPLOYED ({{ user_id }})
+          ============================================
+          Host: {{ ansible_host }}
+
+          Services:
+          - Open WebUI: http://{{ ansible_host }}:{{ open_webui_port }}
+          - n8n: http://{{ ansible_host }}:{{ n8n_port }}
+
+          Next Steps:
+          1. ⚠️  Update PostgreSQL password in {{ repo_dir }}/.env
+          2. Restart services if needed:
+             ssh root@{{ ansible_host }} "cd {{ repo_dir }} && docker compose restart"
+          3. Access Open WebUI and create your account
+          4. Test Ollama connection in Open WebUI
+          5. Access n8n and setup admin account
+          6. Create test workflow in n8n connecting to Ollama
+
+          Connections to Shared Infrastructure:
+          - Ollama: http://{{ shared_ai_host }}:11434
+          - Qdrant: http://{{ shared_ai_host }}:6333
+          - PostgreSQL: {{ shared_ai_host }}:5432
+
+          Secrets saved to: ./{{ user_id }}-secrets-{{ ansible_date_time.epoch }}.txt
+          ============================================

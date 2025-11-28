@@ -1,0 +1,42 @@
+---
+# Minimal Ansible Inventory - Just the essentials
+# Usage: ansible-playbook -i inventory-minimal.yml <playbook>.yml
+
+all:
+  children:
+    # Shared AI Infrastructure
+    shared_ai:
+      hosts:
+        shared-ai-01:
+          ansible_host: 10.0.6.10
+          ansible_user: root
+          ansible_python_interpreter: /usr/bin/python3
+
+          # Service Ports
+          ollama_port: 11434
+          qdrant_port: 6333
+          postgres_port: 5432
+
+    # User Services
+    user_services:
+      hosts:
+        user1-services:
+          ansible_host: 10.0.6.11
+          ansible_user: root
+          ansible_python_interpreter: /usr/bin/python3
+
+          user_id: user1
+          user_name: "User 1"
+
+          # Service Ports
+          open_webui_port: 3000
+          n8n_port: 5678
+
+          # Shared infrastructure connection
+          shared_ai_host: 10.0.6.10
+
+  vars:
+    # Global variables
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+    base_domain: valuechainhackers.xyz
+    ai_admin_user: ai-admin

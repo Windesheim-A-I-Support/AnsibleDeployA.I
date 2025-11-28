@@ -1,0 +1,393 @@
+---
+# PHASE 2 (MINIMAL): Deploy Shared AI Infrastructure
+# Usage: ansible-playbook -i inventory-minimal.yml 02-deploy-shared-ai-minimal.yml
+#
+# This playbook deploys the core AI services:
+# - Ollama (LLM inference)
+# - Qdrant (vector database)
+# - PostgreSQL (database for n8n, Flowise, etc.)
+#
+# Container: 10.0.6.10
+
+- name: Phase 2 (Minimal) - Deploy Shared AI Infrastructure
+  hosts: shared_ai
+  become: yes
+  gather_facts: yes
+
+  vars:
+    repo_dir: "/opt/shared-ai"
+    compose_file: "{{ repo_dir }}/docker-compose.yml"
+
+  tasks:
+    - name: Display deployment information
+      debug:
+        msg: |
+          ============================================
+          PHASE 2 (MINIMAL): SHARED AI INFRASTRUCTURE
+          ============================================
+          Host: {{ inventory_hostname }}
+          IP: {{ ansible_host }}
+          Services: Ollama, Qdrant, PostgreSQL
+          ============================================
+
+    # ======================================
+    # SYSTEM SETUP
+    # ======================================
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - curl
+          - ca-certificates
+          - gnupg
+          - git
+          - python3
+          - python3-pip
+        state: present
+
+    - name: Install Python Docker libraries
+      pip:
+        name:
+          - docker
+          - docker-compose
+        state: present
+
+    # ======================================
+    # DOCKER INSTALLATION
+    # ======================================
+    - name: Check if Docker is installed
+      command: docker --version
+      register: docker_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Docker
+      when: docker_check.rc != 0
+      block:
+        - name: Add Docker GPG key
+          apt_key:
+            url: https://download.docker.com/linux/debian/gpg
+            state: present
+
+        - name: Get Debian version
+          command: lsb_release -cs
+          register: debian_version
+          changed_when: false
+
+        - name: Add Docker repository
+          apt_repository:
+            repo: "deb [arch=amd64] https://download.docker.com/linux/debian {{ debian_version.stdout }} stable"
+            state: present
+
+        - name: Install Docker packages
+          apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
+            update_cache: yes
+
+        - name: Enable Docker service
+          systemd:
+            name: docker
+            enabled: yes
+            state: started
+
+    # ======================================
+    # USER SETUP
+    # ======================================
+    - name: Create AI admin user
+      user:
+        name: "{{ ai_admin_user }}"
+        groups: docker
+        append: yes
+        shell: /bin/bash
+        create_home: yes
+        state: present
+
+    # ======================================
+    # GENERATE SECRETS
+    # ======================================
+    - name: Generate PostgreSQL password
+      shell: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+      register: postgres_password
+      changed_when: false
+      no_log: true
+
+    - name: Save PostgreSQL password
+      set_fact:
+        pg_password: "{{ postgres_password.stdout }}"
+      no_log: true
+
+    # ======================================
+    # DIRECTORY SETUP
+    # ======================================
+    - name: Create repository directory
+      file:
+        path: "{{ repo_dir }}"
+        state: directory
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0755'
+
+    - name: Create data directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0755'
+      loop:
+        - "{{ repo_dir }}/ollama"
+        - "{{ repo_dir }}/qdrant"
+        - "{{ repo_dir }}/postgres"
+
+    # ======================================
+    # DOCKER COMPOSE CONFIGURATION
+    # ======================================
+    - name: Create docker-compose.yml for shared AI services
+      copy:
+        dest: "{{ compose_file }}"
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0644'
+        content: |
+          version: '3.8'
+
+          services:
+            # ==========================================
+            # PostgreSQL - Shared Database
+            # ==========================================
+            postgres:
+              image: postgres:15-alpine
+              container_name: shared-postgres
+              environment:
+                - POSTGRES_USER=postgres
+                - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+                - POSTGRES_DB=postgres
+              volumes:
+                - postgres_data:/var/lib/postgresql/data
+              networks:
+                - ai_network
+              ports:
+                - "{{ postgres_port }}:5432"
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U postgres"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+            # ==========================================
+            # Ollama - LLM Inference Engine
+            # ==========================================
+            ollama:
+              image: ollama/ollama:latest
+              container_name: ollama
+              volumes:
+                - ollama_data:/root/.ollama
+              networks:
+                - ai_network
+              ports:
+                - "{{ ollama_port }}:11434"
+              restart: unless-stopped
+              environment:
+                - OLLAMA_HOST=0.0.0.0:11434
+                - OLLAMA_ORIGINS=*
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+
+            # ==========================================
+            # Qdrant - Vector Database
+            # ==========================================
+            qdrant:
+              image: qdrant/qdrant:latest
+              container_name: qdrant
+              volumes:
+                - qdrant_data:/qdrant/storage
+              networks:
+                - ai_network
+              ports:
+                - "{{ qdrant_port }}:6333"
+              restart: unless-stopped
+              environment:
+                - QDRANT__SERVICE__GRPC_PORT=6334
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+
+          # ==========================================
+          # NETWORKS
+          # ==========================================
+          networks:
+            ai_network:
+              driver: bridge
+
+          # ==========================================
+          # VOLUMES
+          # ==========================================
+          volumes:
+            postgres_data:
+              driver: local
+            ollama_data:
+              driver: local
+            qdrant_data:
+              driver: local
+
+    # ======================================
+    # .ENV FILE
+    # ======================================
+    - name: Create .env file
+      copy:
+        dest: "{{ repo_dir }}/.env"
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0600'
+        content: |
+          # Shared AI Infrastructure Secrets
+          # Generated: {{ ansible_date_time.iso8601 }}
+
+          POSTGRES_PASSWORD={{ pg_password }}
+      no_log: true
+
+    # ======================================
+    # DEPLOY SERVICES
+    # ======================================
+    - name: Start shared AI services
+      community.docker.docker_compose:
+        project_src: "{{ repo_dir }}"
+        state: present
+        pull: yes
+      register: compose_output
+
+    - name: Wait for services to initialize
+      pause:
+        seconds: 30
+        prompt: "Waiting for containers to start..."
+
+    # ======================================
+    # VERIFICATION
+    # ======================================
+    - name: Check running containers
+      command: docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+      register: container_status
+      changed_when: false
+
+    - name: Display container status
+      debug:
+        msg: "{{ container_status.stdout_lines }}"
+
+    - name: Wait for PostgreSQL
+      wait_for:
+        host: localhost
+        port: "{{ postgres_port }}"
+        state: started
+        timeout: 120
+      ignore_errors: yes
+
+    - name: Wait for Ollama
+      wait_for:
+        host: localhost
+        port: "{{ ollama_port }}"
+        state: started
+        timeout: 120
+      ignore_errors: yes
+
+    - name: Wait for Qdrant
+      wait_for:
+        host: localhost
+        port: "{{ qdrant_port }}"
+        state: started
+        timeout: 120
+      ignore_errors: yes
+
+    # ======================================
+    # POST-DEPLOYMENT SETUP
+    # ======================================
+    - name: Pull Ollama embedding model
+      command: docker exec ollama ollama pull nomic-embed-text
+      register: model_pull
+      async: 600
+      poll: 10
+      ignore_errors: yes
+
+    - name: Display model pull result
+      debug:
+        msg: "{{ model_pull.stdout_lines }}"
+      when: model_pull.stdout_lines is defined
+
+    - name: Create PostgreSQL databases for users
+      command: >
+        docker exec shared-postgres psql -U postgres -c
+        "CREATE DATABASE IF NOT EXISTS {{ item }};"
+      loop:
+        - user1_n8n
+        - user1_flowise
+      ignore_errors: yes
+
+    # ======================================
+    # SAVE SECRETS
+    # ======================================
+    - name: Save secrets to local file
+      delegate_to: localhost
+      copy:
+        dest: "./shared-ai-secrets-{{ ansible_date_time.epoch }}.txt"
+        content: |
+          # Shared AI Infrastructure Secrets
+          # Generated: {{ ansible_date_time.iso8601 }}
+          # Host: {{ ansible_host }}
+
+          POSTGRES_PASSWORD={{ pg_password }}
+
+          # Connection strings for user services:
+          POSTGRES_HOST=10.0.6.10
+          POSTGRES_PORT=5432
+          POSTGRES_USER=postgres
+
+          OLLAMA_BASE_URL=http://10.0.6.10:11434
+          QDRANT_URI=http://10.0.6.10:6333
+        mode: '0600'
+      no_log: true
+
+    # ======================================
+    # POST-DEPLOYMENT SUMMARY
+    # ======================================
+    - name: Display deployment summary
+      debug:
+        msg: |
+          ============================================
+          SHARED AI INFRASTRUCTURE DEPLOYED
+          ============================================
+          Host: {{ ansible_host }}
+
+          Services:
+          - PostgreSQL: {{ ansible_host }}:{{ postgres_port }}
+          - Ollama: {{ ansible_host }}:{{ ollama_port }}
+          - Qdrant: {{ ansible_host }}:{{ qdrant_port }}
+
+          Connection Info:
+          - Ollama API: http://{{ ansible_host }}:{{ ollama_port }}
+          - Qdrant API: http://{{ ansible_host }}:{{ qdrant_port }}
+          - PostgreSQL: postgresql://postgres:<password>@{{ ansible_host }}:{{ postgres_port }}
+
+          Next Steps:
+          1. Pull additional Ollama models:
+             docker exec ollama ollama pull llama3.2
+          2. Test Ollama API:
+             curl http://{{ ansible_host }}:{{ ollama_port }}/api/tags
+          3. Deploy user services (Phase 6)
+
+          Secrets saved to: ./shared-ai-secrets-{{ ansible_date_time.epoch }}.txt
+          ============================================

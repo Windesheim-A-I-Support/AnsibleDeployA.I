@@ -1,0 +1,493 @@
+---
+# PHASE 1: Deploy Critical Infrastructure (SSO & Secrets Management)
+# Usage: ansible-playbook -i inventory.yml 01-deploy-critical-infrastructure.yml
+#
+# This playbook deploys:
+# - Authentik (SSO Provider)
+# - Vaultwarden (Password Manager)
+# - Authelia (2FA/SSO Proxy)
+#
+# Container: 10.0.6.5
+
+- name: Phase 1 - Deploy Critical Infrastructure
+  hosts: critical_infrastructure
+  become: yes
+  gather_facts: yes
+
+  vars:
+    repo_dir: "/opt/critical-infrastructure"
+    compose_file: "{{ repo_dir }}/docker-compose.yml"
+
+  tasks:
+    - name: Display deployment information
+      debug:
+        msg: |
+          ============================================
+          PHASE 1: CRITICAL INFRASTRUCTURE
+          ============================================
+          Host: {{ inventory_hostname }}
+          IP: {{ ansible_host }}
+          Services: Authentik, Vaultwarden, Authelia
+          ============================================
+
+    # ======================================
+    # SYSTEM SETUP
+    # ======================================
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - curl
+          - ca-certificates
+          - gnupg
+          - git
+          - python3
+          - python3-pip
+        state: present
+
+    - name: Install Python packages for Ansible
+      pip:
+        name:
+          - docker
+          - docker-compose
+        state: present
+
+    # ======================================
+    # DOCKER INSTALLATION
+    # ======================================
+    - name: Check if Docker is installed
+      command: docker --version
+      register: docker_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Docker
+      when: docker_check.rc != 0
+      block:
+        - name: Add Docker GPG key
+          apt_key:
+            url: https://download.docker.com/linux/debian/gpg
+            state: present
+
+        - name: Get Debian version
+          command: lsb_release -cs
+          register: debian_version
+          changed_when: false
+
+        - name: Add Docker repository
+          apt_repository:
+            repo: "deb [arch=amd64] https://download.docker.com/linux/debian {{ debian_version.stdout }} stable"
+            state: present
+
+        - name: Install Docker packages
+          apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
+            update_cache: yes
+
+        - name: Enable Docker service
+          systemd:
+            name: docker
+            enabled: yes
+            state: started
+
+    - name: Verify Docker installation
+      command: docker --version
+      register: docker_version
+      changed_when: false
+
+    - name: Display Docker version
+      debug:
+        msg: "{{ docker_version.stdout }}"
+
+    # ======================================
+    # USER SETUP
+    # ======================================
+    - name: Create AI admin user
+      user:
+        name: "{{ ai_admin_user }}"
+        groups: docker
+        append: yes
+        shell: /bin/bash
+        create_home: yes
+        state: present
+
+    - name: Add sudoers rule for ai-admin
+      lineinfile:
+        path: /etc/sudoers.d/{{ ai_admin_user }}
+        line: "{{ ai_admin_user }} ALL=(ALL) NOPASSWD: ALL"
+        create: yes
+        mode: '0440'
+        validate: 'visudo -cf %s'
+
+    # ======================================
+    # GENERATE SECRETS
+    # ======================================
+    - name: Generate secure secrets for services
+      shell: |
+        python3 << 'EOF'
+        import secrets
+        import random
+
+        secrets_dict = {
+            # Authentik
+            'AUTHENTIK_SECRET_KEY': secrets.token_urlsafe(50),
+            'AUTHENTIK_POSTGRES_PASSWORD': secrets.token_urlsafe(32),
+            'AUTHENTIK_REDIS_PASSWORD': secrets.token_urlsafe(32),
+
+            # Vaultwarden
+            'VAULTWARDEN_ADMIN_TOKEN': secrets.token_urlsafe(32),
+
+            # Authelia
+            'AUTHELIA_JWT_SECRET': secrets.token_hex(32),
+            'AUTHELIA_SESSION_SECRET': secrets.token_hex(32),
+            'AUTHELIA_STORAGE_ENCRYPTION_KEY': secrets.token_hex(32),
+            'AUTHELIA_HMAC_SECRET': secrets.token_hex(32),
+
+            # PostgreSQL (shared for Authentik)
+            'POSTGRES_PASSWORD': secrets.token_urlsafe(32),
+            'POSTGRES_USER': 'authentik',
+            'POSTGRES_DB': 'authentik'
+        }
+
+        # Output as environment variables
+        for key, value in secrets_dict.items():
+            print(f"{key}={value}")
+        EOF
+      register: generated_secrets
+      changed_when: false
+      no_log: true
+
+    - name: Save secrets to facts
+      set_fact:
+        critical_secrets: "{{ generated_secrets.stdout_lines | map('regex_replace', '(.*?)=(.*)', '\\1|||\\2') | list }}"
+      no_log: true
+
+    # ======================================
+    # DIRECTORY SETUP
+    # ======================================
+    - name: Create repository directory
+      file:
+        path: "{{ repo_dir }}"
+        state: directory
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0755'
+
+    - name: Create data directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0755'
+      loop:
+        - "{{ repo_dir }}/authentik/media"
+        - "{{ repo_dir }}/authentik/templates"
+        - "{{ repo_dir }}/authentik/certs"
+        - "{{ repo_dir }}/vaultwarden/data"
+        - "{{ repo_dir }}/authelia/config"
+        - "{{ repo_dir }}/authelia/data"
+
+    # ======================================
+    # DOCKER COMPOSE CONFIGURATION
+    # ======================================
+    - name: Create docker-compose.yml for critical infrastructure
+      copy:
+        dest: "{{ compose_file }}"
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0644'
+        content: |
+          version: '3.8'
+
+          services:
+            # ==========================================
+            # PostgreSQL - Shared Database
+            # ==========================================
+            postgres:
+              image: postgres:15-alpine
+              container_name: critical-postgres
+              environment:
+                - POSTGRES_USER=${POSTGRES_USER}
+                - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+                - POSTGRES_DB=${POSTGRES_DB}
+              volumes:
+                - postgres_data:/var/lib/postgresql/data
+              networks:
+                - critical_network
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+            # ==========================================
+            # Redis - Session Store for Authentik
+            # ==========================================
+            redis:
+              image: redis:alpine
+              container_name: critical-redis
+              command: redis-server --requirepass ${AUTHENTIK_REDIS_PASSWORD}
+              networks:
+                - critical_network
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+            # ==========================================
+            # Authentik Server - SSO Provider
+            # ==========================================
+            authentik-server:
+              image: ghcr.io/goauthentik/server:latest
+              container_name: authentik-server
+              command: server
+              environment:
+                - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY}
+                - AUTHENTIK_POSTGRESQL__HOST=postgres
+                - AUTHENTIK_POSTGRESQL__NAME=${POSTGRES_DB}
+                - AUTHENTIK_POSTGRESQL__USER=${POSTGRES_USER}
+                - AUTHENTIK_POSTGRESQL__PASSWORD=${POSTGRES_PASSWORD}
+                - AUTHENTIK_REDIS__HOST=redis
+                - AUTHENTIK_REDIS__PASSWORD=${AUTHENTIK_REDIS_PASSWORD}
+                - AUTHENTIK_ERROR_REPORTING__ENABLED=false
+              ports:
+                - "{{ authentik_port }}:9000"
+                - "{{ authentik_https_port }}:9443"
+              volumes:
+                - ./authentik/media:/media
+                - ./authentik/templates:/templates
+              networks:
+                - critical_network
+              depends_on:
+                - postgres
+                - redis
+              restart: unless-stopped
+
+            # ==========================================
+            # Authentik Worker - Background Tasks
+            # ==========================================
+            authentik-worker:
+              image: ghcr.io/goauthentik/server:latest
+              container_name: authentik-worker
+              command: worker
+              environment:
+                - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY}
+                - AUTHENTIK_POSTGRESQL__HOST=postgres
+                - AUTHENTIK_POSTGRESQL__NAME=${POSTGRES_DB}
+                - AUTHENTIK_POSTGRESQL__USER=${POSTGRES_USER}
+                - AUTHENTIK_POSTGRESQL__PASSWORD=${POSTGRES_PASSWORD}
+                - AUTHENTIK_REDIS__HOST=redis
+                - AUTHENTIK_REDIS__PASSWORD=${AUTHENTIK_REDIS_PASSWORD}
+                - AUTHENTIK_ERROR_REPORTING__ENABLED=false
+              user: root
+              volumes:
+                - /var/run/docker.sock:/var/run/docker.sock
+                - ./authentik/media:/media
+                - ./authentik/templates:/templates
+                - ./authentik/certs:/certs
+              networks:
+                - critical_network
+              depends_on:
+                - postgres
+                - redis
+              restart: unless-stopped
+
+            # ==========================================
+            # Vaultwarden - Password Manager
+            # ==========================================
+            vaultwarden:
+              image: vaultwarden/server:latest
+              container_name: vaultwarden
+              environment:
+                - ADMIN_TOKEN=${VAULTWARDEN_ADMIN_TOKEN}
+                - DOMAIN=https://test-vault.{{ base_domain }}
+                - SIGNUPS_ALLOWED=false
+                - INVITATIONS_ALLOWED=true
+                - WEBSOCKET_ENABLED=true
+              ports:
+                - "{{ vaultwarden_port }}:80"
+              volumes:
+                - ./vaultwarden/data:/data
+              networks:
+                - critical_network
+              restart: unless-stopped
+
+            # ==========================================
+            # Authelia - 2FA/SSO Proxy
+            # ==========================================
+            authelia:
+              image: authelia/authelia:latest
+              container_name: authelia
+              environment:
+                - AUTHELIA_JWT_SECRET=${AUTHELIA_JWT_SECRET}
+                - AUTHELIA_SESSION_SECRET=${AUTHELIA_SESSION_SECRET}
+                - AUTHELIA_STORAGE_ENCRYPTION_KEY=${AUTHELIA_STORAGE_ENCRYPTION_KEY}
+                - AUTHELIA_NOTIFIER_SMTP_PASSWORD=${AUTHELIA_HMAC_SECRET}
+              ports:
+                - "{{ authelia_port }}:9091"
+              volumes:
+                - ./authelia/config:/config
+                - ./authelia/data:/data
+              networks:
+                - critical_network
+              restart: unless-stopped
+
+          # ==========================================
+          # NETWORKS
+          # ==========================================
+          networks:
+            critical_network:
+              driver: bridge
+
+          # ==========================================
+          # VOLUMES
+          # ==========================================
+          volumes:
+            postgres_data:
+              driver: local
+
+    # ======================================
+    # .ENV FILE
+    # ======================================
+    - name: Create .env file with generated secrets
+      copy:
+        dest: "{{ repo_dir }}/.env"
+        owner: "{{ ai_admin_user }}"
+        group: "{{ ai_admin_user }}"
+        mode: '0600'
+        content: |
+          # Generated secrets for critical infrastructure
+          # Generated at: {{ ansible_date_time.iso8601 }}
+
+          {% for line in generated_secrets.stdout_lines %}
+          {{ line }}
+          {% endfor %}
+      no_log: true
+
+    # ======================================
+    # DEPLOY SERVICES
+    # ======================================
+    - name: Start critical infrastructure services
+      community.docker.docker_compose:
+        project_src: "{{ repo_dir }}"
+        state: present
+        pull: yes
+      register: compose_output
+
+    - name: Wait for services to be healthy
+      pause:
+        seconds: 30
+        prompt: "Waiting for services to initialize..."
+
+    # ======================================
+    # VERIFICATION
+    # ======================================
+    - name: Check running containers
+      command: docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+      register: container_status
+      changed_when: false
+
+    - name: Display container status
+      debug:
+        msg: "{{ container_status.stdout_lines }}"
+
+    - name: Wait for Authentik to be ready
+      uri:
+        url: "http://{{ ansible_host }}:{{ authentik_port }}"
+        status_code: 200
+        timeout: 5
+      register: result
+      until: result.status == 200
+      retries: 30
+      delay: 10
+      ignore_errors: yes
+
+    - name: Wait for Vaultwarden to be ready
+      uri:
+        url: "http://{{ ansible_host }}:{{ vaultwarden_port }}"
+        status_code: 200
+        timeout: 5
+      register: result
+      until: result.status == 200
+      retries: 30
+      delay: 10
+      ignore_errors: yes
+
+    - name: Wait for Authelia to be ready
+      uri:
+        url: "http://{{ ansible_host }}:{{ authelia_port }}"
+        status_code: 200
+        timeout: 5
+      register: result
+      until: result.status == 200
+      retries: 30
+      delay: 10
+      ignore_errors: yes
+
+    # ======================================
+    # POST-DEPLOYMENT SUMMARY
+    # ======================================
+    - name: Display deployment summary
+      debug:
+        msg: |
+          ============================================
+          CRITICAL INFRASTRUCTURE DEPLOYED
+          ============================================
+          Host: {{ ansible_host }}
+
+          Services:
+          - Authentik: http://{{ ansible_host }}:{{ authentik_port }}
+          - Vaultwarden: http://{{ ansible_host }}:{{ vaultwarden_port }}
+          - Authelia: http://{{ ansible_host }}:{{ authelia_port }}
+
+          Next Steps:
+          1. Configure Traefik routing for these services
+          2. Access Authentik and complete initial setup
+          3. Create admin user in Authentik
+          4. Configure OAuth2 providers for downstream services
+          5. Access Vaultwarden admin panel and create organization
+          6. Store all infrastructure secrets in Vaultwarden
+
+          Traefik Domains:
+          - test-authentik.{{ base_domain }}
+          - test-vault.{{ base_domain }}
+          - test-auth.{{ base_domain }}
+          ============================================
+
+    - name: Save secrets to local file for reference
+      delegate_to: localhost
+      copy:
+        dest: "./critical-infrastructure-secrets-{{ ansible_date_time.epoch }}.txt"
+        content: |
+          # Critical Infrastructure Secrets
+          # Generated: {{ ansible_date_time.iso8601 }}
+          # Host: {{ ansible_host }}
+
+          {% for line in generated_secrets.stdout_lines %}
+          {{ line }}
+          {% endfor %}
+
+          # Services:
+          # Authentik: http://{{ ansible_host }}:{{ authentik_port }}
+          # Vaultwarden: http://{{ ansible_host }}:{{ vaultwarden_port }}
+          # Authelia: http://{{ ansible_host }}:{{ authelia_port }}
+        mode: '0600'
+      no_log: true
+
+    - name: Display secrets file location
+      debug:
+        msg: "Secrets saved to: ./critical-infrastructure-secrets-{{ ansible_date_time.epoch }}.txt"
